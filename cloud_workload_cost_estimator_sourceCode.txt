@@ -1,0 +1,121 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, when, sum as _sum, avg
+
+spark = SparkSession.builder.getOrCreate()
+df = spark.read.csv(r"D:\CloudOptimizer\cloud_workload_clean.csv",header=True,inferSchema=True)
+df.printSchema()
+df.show(2)
+
+from pyspark.sql.functions import col
+for c in df.columns:
+    missing = df.filter(col(c).isNull()).count()
+    print(c, ":", missing)
+
+
+numeric_columns=["cpu_usage","canonical_memory_usage","assigned_memory","unmapped_page_cache","page_cache_memory","max_memory_usage","mean_disk_io_time","mean_local_disk_space","max_cpu_rate","max_disk_io_time","cycles_per_instruction","memory_accesses_per_instruction","sample_rate","random_sample_cpu_usage"]
+
+for c in numeric_columns:
+	median = df.approxQuantile(c, [0.5], 0.01)[0]
+	df = df.fillna({c: median})
+
+df = df.withColumn("duration_sec", (col("end_time") - col("start_time")) / 1000000)
+
+df = df.filter((col("duration_sec") > 0) & (col("assigned_memory") > 0))
+
+print("Total rows:", df.count())
+print("Unique rows:", df.distinct().count())
+
+
+cpu_price = 0.033     
+mem_price = 0.0045    
+disk_price = 0.00014  
+
+df = df.withColumn("cost_per_sec",(col("max_cpu_rate") * 8 * cpu_price + col("assigned_memory") * 32 * mem_price + col("mean_local_disk_space") * 100 * disk_price) / 3600)
+
+df = df.withColumn("cost", col("cost_per_sec") * col("duration_sec"))
+
+df = df.withColumn("fail_risk",when(col("max_memory_usage") > 0.9 * col("assigned_memory"), 1).otherwise(0))
+
+df.select("job_id", "duration_sec", "cost_per_sec", "cost", "fail_risk").show(5)
+
+df.groupBy("fail_risk").count().show()
+
+
+import matplotlib.pyplot as plt
+eda1 = df.select("cpu_usage").toPandas()
+plt.hist(eda1["cpu_usage"])
+plt.xlabel("CPU Usage")
+plt.ylabel("Frequency")
+plt.title("CPU Usage Distribution")
+plt.tight_layout()
+plt.savefig("cpu_hist.png", dpi=150)
+plt.close()
+print("eda1 graph saved successfully")
+
+eda2 = df.select("assigned_memory","canonical_memory_usage").sample(fraction=0.1,seed=42).toPandas()
+plt.scatter(eda2["assigned_memory"],eda2["canonical_memory_usage"])
+plt.xlabel("Assigned Memory")
+plt.ylabel("Actual Memory Usage")
+plt.title("Assigned vs Actual Memory")
+plt.tight_layout()
+plt.savefig("memory_scatter.png", dpi=150)
+plt.close()
+print("eda2 graph saved successfully")
+
+from pyspark.ml.feature import VectorAssembler
+
+features = ["cpu_usage","max_memory_usage","page_cache_memory","unmapped_page_cache",
+            "mean_disk_io_time","max_disk_io_time",
+            "cycles_per_instruction","memory_accesses_per_instruction"]
+
+assembler = VectorAssembler(inputCols=features,outputCol="features")
+df2 = assembler.transform(df)
+df2.show(5)
+
+train, test = df2.randomSplit([0.8, 0.2],seed=42)
+
+from pyspark.ml.regression import LinearRegression, RandomForestRegressor
+
+lr = LinearRegression(featuresCol="features", labelCol="cost_per_sec")
+lr_model = lr.fit(train)
+rf = RandomForestRegressor(featuresCol="features", labelCol="cost_per_sec", numTrees=50, seed=42)
+rf_model = rf.fit(train)
+lr_pred = lr_model.transform(test)
+rf_pred = rf_model.transform(test)
+
+from pyspark.ml.evaluation import RegressionEvaluator
+
+ev = RegressionEvaluator(labelCol="cost_per_sec", metricName="mae")
+print("LR MAE:", ev.evaluate(lr_pred))
+print("RF MAE:", ev.evaluate(rf_pred))
+
+ev.setMetricName("rmse")
+print("LR RMSE:", ev.evaluate(lr_pred))
+print("RF RMSE:", ev.evaluate(rf_pred))
+
+ev.setMetricName("r2")
+lr_r2 = ev.evaluate(lr_pred)
+rf_r2 = ev.evaluate(rf_pred)
+print("LR R2:",lr_r2)
+print("RF R2:",rf_r2)
+
+
+result = rf_pred.select("cost_per_sec", "prediction").sample(False, 0.1, 42).toPandas()
+plt.scatter(result["cost_per_sec"], result["prediction"])
+plt.xlabel("Actual Cost per Second")
+plt.ylabel("Predicted Cost per Second")
+plt.title("Actual vs Predicted Cost")
+plt.tight_layout()
+plt.savefig("actual_vs_predicted.png", dpi=150)
+plt.show()
+
+
+plt.bar(["Linear Regression", "Random Forest"],[lr_r2, rf_r2])
+plt.ylabel("R2 Score")
+plt.title("Model Performance Comparison")
+plt.tight_layout()
+plt.savefig("model_comparison.png", dpi=150)
+plt.show()
+
+
+
